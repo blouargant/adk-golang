@@ -35,14 +35,6 @@ type OpenAIConfig struct {
 	Stream      bool          `json:"stream"`
 }
 
-func printDebug(name string, data any) {
-	if jsonData, err := json.MarshalIndent(data, "", "  "); err == nil {
-		fmt.Printf("--- DEBUG [%s] ---\n%s\n", name, string(jsonData))
-	} else {
-		fmt.Printf("--- DEBUG [%s] ERROR ---\n%v\n", name, err)
-	}
-}
-
 // DefaultOpenAIConfig returns a default configuration for OpenAI.
 func DefaultOpenAIConfig() *OpenAIConfig {
 	return &OpenAIConfig{
@@ -82,12 +74,10 @@ func NewOpenAIConnection(config *OpenAIConfig) *OpenAIConnection {
 // GenerateContent sends a request to OpenAI and returns the response.
 func (c *OpenAIConnection) GenerateContent(ctx context.Context, request *core.LLMRequest) (*core.LLMResponse, error) {
 	// Convert ADK request to OpenAI format
-	printDebug("request", request)
 	chatReq, err := c.convertToOpenAIRequest(request)
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert request: %w", err)
 	}
-	printDebug("chatReq", chatReq)
 
 	// Make request to OpenAI
 	chatResp, err := c.client.Chat.Completions.New(ctx, *chatReq)
@@ -95,10 +85,9 @@ func (c *OpenAIConnection) GenerateContent(ctx context.Context, request *core.LL
 		fmt.Printf("OpenAI API request failed: %v\n", err)
 		return nil, fmt.Errorf("OpenAI API request failed: %w", err)
 	}
-	printDebug("chatResp", chatResp)
+
 	// Convert to ADK response
 	resp := c.convertFromOpenAIResponse(*chatResp)
-	printDebug("response", resp)
 	return resp, nil
 }
 
@@ -239,89 +228,92 @@ func (c *OpenAIConnection) convertToOpenAIRequest(request *core.LLMRequest) (*op
 	messages := make([]openai.ChatCompletionMessageParamUnion, 0, len(request.Contents))
 	for _, content := range request.Contents {
 		role := c.mapRole(content.Role)
-		//printDebug("role", role)
 
-		// Process content parts to combine text
-		var textParts []string
-		var hasToolCalls bool
+		// Handle assistant messages with function calls specially
+		if role == "assistant" {
+			// Check if this content has function calls
+			var toolCalls []openai.ChatCompletionMessageToolCallParam
+			var textParts []string
 
-		for _, part := range content.Parts {
-			//printDebug("part", part)
-			switch part.Type {
-			case "text":
-				if part.Text != nil {
-					textParts = append(textParts, *part.Text)
-				}
-			case "function_call":
-				if part.FunctionCall != nil {
-					hasToolCalls = true
-					// For now, represent as text until we get tool calls working properly
-					textParts = append(textParts, fmt.Sprintf("Calling function: %s(%s)",
-						part.FunctionCall.Name, c.convertArgsToJSON(part.FunctionCall.Args)))
-				}
-			case "function_response":
-				if part.FunctionResponse != nil {
-					// For function responses, create a tool message
-					msg, err := c.convertResponseToJSON(part.FunctionResponse.Response)
-					if err == nil {
-						toolMessage := openai.ToolMessage(
-							msg,
-							part.FunctionResponse.ID,
-						)
-						messages = append(messages, toolMessage)
+			for _, part := range content.Parts {
+				switch part.Type {
+				case "text":
+					if part.Text != nil {
+						textParts = append(textParts, *part.Text)
 					}
-					continue // Skip the regular message creation for this part
-				}
-			default:
-				if part.Text != nil {
-					textParts = append(textParts, *part.Text)
+				case "function_call":
+					if part.FunctionCall != nil {
+						toolCall := openai.ChatCompletionMessageToolCallParam{
+							ID:   part.FunctionCall.ID,
+							Type: "function",
+							Function: openai.ChatCompletionMessageToolCallFunctionParam{
+								Name:      part.FunctionCall.Name,
+								Arguments: c.convertArgsToJSON(part.FunctionCall.Args),
+							},
+						}
+						toolCalls = append(toolCalls, toolCall)
+					}
 				}
 			}
-		}
 
-		// Skip messages with no content
-		contentText := strings.Join(textParts, "\n")
-		if contentText == "" && !hasToolCalls {
+			// Create assistant message with or without tool calls
+			contentText := strings.Join(textParts, "\n")
+			if len(toolCalls) > 0 {
+				// For assistant messages with tool calls, we need to manually create the param
+				assistantMsg := openai.ChatCompletionAssistantMessageParam{
+					ToolCalls: toolCalls,
+				}
+				if contentText != "" {
+					assistantMsg.Content.OfString = openai.String(contentText)
+				}
+				messages = append(messages, openai.ChatCompletionMessageParamUnion{OfAssistant: &assistantMsg})
+			} else if contentText != "" {
+				// Regular assistant message
+				message := openai.AssistantMessage(contentText)
+				messages = append(messages, message)
+			}
 			continue
 		}
 
-		// Create message based on role and content
+		// Handle function responses as tool messages
+		for _, part := range content.Parts {
+			if part.Type == "function_response" && part.FunctionResponse != nil {
+				msg, err := c.convertResponseToJSON(part.FunctionResponse.Response)
+				if err == nil {
+					toolMessage := openai.ToolMessage(msg, part.FunctionResponse.ID)
+					messages = append(messages, toolMessage)
+				}
+			}
+		}
+
+		// Handle other message types (system, user, etc.)
+		var textParts []string
+		for _, part := range content.Parts {
+			if part.Type == "text" && part.Text != nil {
+				textParts = append(textParts, *part.Text)
+			}
+		}
+
+		contentText := strings.Join(textParts, "\n")
+		if contentText == "" {
+			continue
+		}
+
 		switch role {
 		case "system":
-			if contentText != "" {
-				message := openai.SystemMessage(contentText)
-				messages = append(messages, message)
-			}
+			message := openai.SystemMessage(contentText)
+			messages = append(messages, message)
 		case "user":
-			if contentText != "" {
-				message := openai.UserMessage(contentText)
-				messages = append(messages, message)
-			}
-		case "assistant":
-			if contentText != "" {
-				message := openai.AssistantMessage(contentText)
-				messages = append(messages, message)
-			}
-		case "tool":
-			// For tool messages, we will handle them separately
-			if contentText != "" {
-				toolMessage := openai.ToolMessage(contentText, "")
-				messages = append(messages, toolMessage)
-
-			}
+			message := openai.UserMessage(contentText)
+			messages = append(messages, message)
 		case "agent":
-			// For agent messages, treat as assistant
-			if contentText != "" {
-				// Use assistant message for agent role
-				message := openai.AssistantMessage(contentText)
-				messages = append(messages, message)
-			}
+			// For agent messages, treat as assistant (but this should have been handled above)
+			message := openai.AssistantMessage(contentText)
+			messages = append(messages, message)
 		default:
 			// Default to user message
-			if contentText != "" {
-				message := openai.UserMessage(contentText)
-				messages = append(messages, message)
-			}
+			message := openai.UserMessage(contentText)
+			messages = append(messages, message)
 		}
 	}
 
