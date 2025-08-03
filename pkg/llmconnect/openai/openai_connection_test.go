@@ -109,7 +109,7 @@ func TestRoleMapping(t *testing.T) {
 	}{
 		{"user", "user"},
 		{"assistant", "assistant"},
-		{"agent", "assistant"},
+		{"agent", "tool"},
 		{"model", "assistant"},
 		{"system", "system"},
 		{"unknown", "user"},

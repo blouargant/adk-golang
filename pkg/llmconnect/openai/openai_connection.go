@@ -16,11 +16,13 @@ import (
 )
 
 var _ core.LLMConnection = (*OpenAIConnection)(nil)
+var _ OpenAIConnectionInterface = (*OpenAIConnection)(nil)
 
-// OpenAIConnection implements the LLMConnection interface for OpenAI.
+// OpenAIConnection implements the OpenAIConnectionInterface for OpenAI.
 type OpenAIConnection struct {
-	client *openai.Client
-	config *OpenAIConfig
+	client       *openai.Client
+	config       *OpenAIConfig
+	providerName string
 }
 
 // OpenAIConfig contains configuration options for OpenAI connections.
@@ -49,6 +51,12 @@ func DefaultOpenAIConfig() *OpenAIConfig {
 
 // NewOpenAIConnection creates a new OpenAI connection with the given configuration.
 func NewOpenAIConnection(config *OpenAIConfig) *OpenAIConnection {
+	return NewOpenAIConnectionWithProvider(config, "openai")
+}
+
+// NewOpenAIConnectionWithProvider creates a new OpenAI-compatible connection with a custom provider name.
+// This is useful for OpenAI-compatible APIs like Azure OpenAI, Anthropic, etc.
+func NewOpenAIConnectionWithProvider(config *OpenAIConfig, providerName string) *OpenAIConnection {
 	if config == nil {
 		config = DefaultOpenAIConfig()
 	}
@@ -66,9 +74,22 @@ func NewOpenAIConnection(config *OpenAIConfig) *OpenAIConnection {
 	client := openai.NewClient(opts...)
 
 	return &OpenAIConnection{
-		client: &client,
-		config: config,
+		client:       &client,
+		config:       config,
+		providerName: providerName,
 	}
+}
+
+// NewOpenAIConnectionInterface creates a new OpenAI connection that implements OpenAIConnectionInterface.
+// This is the recommended way to create connections when you need the interface.
+func NewOpenAIConnectionInterface(config *OpenAIConfig) OpenAIConnectionInterface {
+	return NewOpenAIConnection(config)
+}
+
+// NewOpenAICompatibleConnection creates a new OpenAI-compatible connection for third-party providers.
+// This function is useful for creating connections to services like Azure OpenAI, Anthropic Claude API, etc.
+func NewOpenAICompatibleConnection(config *OpenAIConfig, providerName string) OpenAIConnectionInterface {
+	return NewOpenAIConnectionWithProvider(config, providerName)
 }
 
 // GenerateContent sends a request to OpenAI and returns the response.
@@ -78,16 +99,17 @@ func (c *OpenAIConnection) GenerateContent(ctx context.Context, request *core.LL
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert request: %w", err)
 	}
-
 	// Make request to OpenAI
 	chatResp, err := c.client.Chat.Completions.New(ctx, *chatReq)
 	if err != nil {
 		fmt.Printf("OpenAI API request failed: %v\n", err)
 		return nil, fmt.Errorf("OpenAI API request failed: %w", err)
 	}
-
 	// Convert to ADK response
 	resp := c.convertFromOpenAIResponse(*chatResp)
+	if resp == nil {
+		return nil, fmt.Errorf("failed to generate response")
+	}
 	return resp, nil
 }
 
@@ -228,7 +250,6 @@ func (c *OpenAIConnection) convertToOpenAIRequest(request *core.LLMRequest) (*op
 	messages := make([]openai.ChatCompletionMessageParamUnion, 0, len(request.Contents))
 	for _, content := range request.Contents {
 		role := c.mapRole(content.Role)
-
 		// Handle assistant messages with function calls specially
 		if role == "assistant" {
 			// Check if this content has function calls
@@ -274,6 +295,19 @@ func (c *OpenAIConnection) convertToOpenAIRequest(request *core.LLMRequest) (*op
 			}
 			continue
 		}
+		if role == "tool" {
+			// Convert tool messages to tool messages
+			for _, part := range content.Parts {
+				if part.Type == "function_response" && part.FunctionResponse != nil {
+					msg, err := c.convertResponseToJSON(part.FunctionResponse.Response)
+					if err == nil {
+						toolMessage := openai.ToolMessage(msg, part.FunctionResponse.ID)
+						messages = append(messages, toolMessage)
+					}
+				}
+			}
+			continue
+		}
 
 		// Handle function responses as tool messages
 		for _, part := range content.Parts {
@@ -289,7 +323,7 @@ func (c *OpenAIConnection) convertToOpenAIRequest(request *core.LLMRequest) (*op
 		// Handle other message types (system, user, etc.)
 		var textParts []string
 		for _, part := range content.Parts {
-			if part.Type == "text" && part.Text != nil {
+			if part.Text != nil {
 				textParts = append(textParts, *part.Text)
 			}
 		}
@@ -305,10 +339,6 @@ func (c *OpenAIConnection) convertToOpenAIRequest(request *core.LLMRequest) (*op
 			messages = append(messages, message)
 		case "user":
 			message := openai.UserMessage(contentText)
-			messages = append(messages, message)
-		case "agent":
-			// For agent messages, treat as assistant (but this should have been handled above)
-			message := openai.AssistantMessage(contentText)
 			messages = append(messages, message)
 		default:
 			// Default to user message
@@ -509,8 +539,10 @@ func (c *OpenAIConnection) mapRole(role string) string {
 	switch role {
 	case "user":
 		return "user"
-	case "agent", "model", "assistant":
+	case "model", "assistant":
 		return "assistant"
+	case "agent":
+		return "tool"
 	case "system":
 		return "system"
 	default:
@@ -530,4 +562,93 @@ func (c *OpenAIConnection) mapRoleFromOpenAI(role string) string {
 	default:
 		return "assistant"
 	}
+}
+
+// GetConfig returns the configuration used by this connection.
+func (c *OpenAIConnection) GetConfig() *OpenAIConfig {
+	return c.config
+}
+
+// SetConfig updates the configuration for this connection.
+func (c *OpenAIConnection) SetConfig(config *OpenAIConfig) error {
+	if config == nil {
+		return fmt.Errorf("config cannot be nil")
+	}
+
+	// Validate the new configuration
+	if config.APIKey == "" {
+		return fmt.Errorf("API key is required")
+	}
+	if config.Model == "" {
+		return fmt.Errorf("model is required")
+	}
+
+	// Update the configuration
+	c.config = config
+
+	// Recreate the client with new configuration
+	opts := []option.RequestOption{
+		option.WithAPIKey(config.APIKey),
+	}
+
+	if config.BaseURL != "" {
+		opts = append(opts, option.WithBaseURL(config.BaseURL))
+	}
+
+	client := openai.NewClient(opts...)
+	c.client = &client
+
+	return nil
+}
+
+// GetModel returns the currently configured model.
+func (c *OpenAIConnection) GetModel() string {
+	if c.config == nil {
+		return ""
+	}
+	return c.config.Model
+}
+
+// SetModel updates the model for this connection.
+func (c *OpenAIConnection) SetModel(model string) {
+	if c.config != nil {
+		c.config.Model = model
+	}
+}
+
+// ValidateConfig validates the current configuration.
+func (c *OpenAIConnection) ValidateConfig() error {
+	if c.config == nil {
+		return fmt.Errorf("configuration is nil")
+	}
+
+	if c.config.APIKey == "" {
+		return fmt.Errorf("API key is required")
+	}
+
+	if c.config.Model == "" {
+		return fmt.Errorf("model is required")
+	}
+
+	if c.config.Temperature != nil && (*c.config.Temperature < 0 || *c.config.Temperature > 2) {
+		return fmt.Errorf("temperature must be between 0 and 2")
+	}
+
+	if c.config.TopP != nil && (*c.config.TopP < 0 || *c.config.TopP > 1) {
+		return fmt.Errorf("top_p must be between 0 and 1")
+	}
+
+	if c.config.MaxTokens != nil && *c.config.MaxTokens <= 0 {
+		return fmt.Errorf("max_tokens must be positive")
+	}
+
+	return nil
+}
+
+// GetProviderName returns the name of the API provider.
+func (c *OpenAIConnection) GetProviderName() string {
+	if c.providerName != "" {
+		return c.providerName
+	}
+	return "openai"
 }
