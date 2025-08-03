@@ -1,78 +1,74 @@
-ADK (Agent Development Kit) is a framework for building AI agents, and we're implement ADK with Golang.
-Their is 2 main parts:
-- Agent2Agent (A2A) protocol. Please read the docs here https://a2aproject.github.io/A2A/latest/specification/ 
-- ADK implementation: https://google.github.io/adk-docs/
-  - Python API https://google.github.io/adk-docs/api-reference/python/
-  - Java API https://google.github.io/adk-docs/api-reference/java/
+# ADK-Golang Coding Instructions
 
-And we're working to implement an Golang API.
-# Core Architecture:
-- Agents: BaseAgent, LlmAgent, RemoteA2aAgent
-- Tools: BaseTool, FunctionTool, AgentTool
-- Runner: Runner - orchestrates agent execution
-- Sessions: Session management and state persistence
-- Events: Communication units between agents
-- A2A Integration: A2aAgentExecutor
+ADK (Agent Development Kit) is a Go implementation of a framework for building AI agents, compatible with the [Agent2Agent (A2A) protocol](https://a2aproject.github.io/A2A/latest/specification/).
 
-# Key Design Considerations for Go
-- Concurrency: Use goroutines and channels instead of Python's asyncio. Aware of race conditions and deadlocks.
-- Error Handling: Explicit error returns instead of exceptions
-- Context: Use context.Context for cancellation and timeouts
-- Interfaces: Define small, focused interfaces following Go idioms. Using interface or generic where appropriates.
-- JSON: Proper struct tags for JSON marshaling/unmarshaling
-- Modular: use more Go native approach when come to multi-agent projects
+## Core Architecture
 
-# Success Metrics
-- Can create and run basic agents
-- Tool system works with function calling
-- A2A protocol integration functional
-- CLI commands operational
-- HTTP API server running
-- Multi-agent workflows supported
-- Compatible with existing A2A agents
+**Event-Driven Agent System**: All agents implement `BaseAgent` interface with async execution via channels (`EventStream <-chan *Event`). The `Runner` orchestrates execution with real-time streaming.
 
-# Development Instructions:
-- Follow SOLID principles
-- ALWAYS check adk-python implementation for reference
-- Follow Go idioms and best practices
-- Use `go fmt` for formatting
-- Use `go vet` and static analysis tools
-- Write unit tests for all components
-- Use interfaces for extensibility
-- Always try to use context.Context for cancellation and timeouts
-- Try to test versus adk-python where possible
-- Make sure the code is compatible and can be integrated with existing codebase
-- Review all old examples and tests to ensure they are up-to-date
-- Run `go install ./...` and `go test ./...` to build and test the project after making changes
-- use `ptr.Float32` creating pointers to float32 values, e.g. `ptr.Float32(0.7)`
-- Use `ptr.Ptr` creating pointers to values for other types, e.g. `ptr.Ptr(true)` or `ptr.Ptr(2000)`
-- Ensure all `Kind` fields in objects are set correctly to match the A2A specification:
-  - For `Task`, use `"task"`
-  - For `TaskStatusUpdateEvent`, use `"status-update"`
-  - For `TaskArtifactUpdateEvent`, use `"artifact-update"`
-  - For `Message`, use `"message"`
+**Key Components**:
+- **Agents**: `CustomAgent` (base), `LLMAgent`, `SequentialAgent`, `RemoteA2aAgent`
+- **Tools**: `FunctionTool` with reflection-based auto-binding, streaming tools in `tools/async/`
+- **Sessions**: Scoped state management with `InMemorySessionService`/`FileSessionService`
+- **A2A Integration**: Full protocol compliance in `pkg/a2a/` with `Task`, `Message`, `AgentCard` objects
 
-# Project Structure:
-```
-adk-golang/
-├── cmd/
-│   └── adk/              # CLI application
-├── docs/                 # Documentation files, all development notes
-├── pkg/
-│   ├── agents/           # Agent implementations
-│   ├── tools/            # Tool system
-│   ├── events/           # Event system
-│   ├── sessions/         # Session management
-│   ├── a2a/              # A2A protocol implementation
-│   └── api/              # HTTP API server
-├── internal/
-│   ├── core/             # Core types and interfaces
-│   ├── llm/              # LLM integrations
-│   └── utils/            # Utilities
-├── examples/             # Example agents and usage
-└── tests/                # Test suites
+## Critical Patterns
+
+**Interface Design**: Small, focused interfaces with context propagation:
+```go
+type BaseAgent interface {
+    RunAsync(invocationCtx *InvocationContext) (EventStream, error)
+    // Always use InvocationContext, never plain context.Context
+}
 ```
 
-# Good read:
-## Message or Task?
-- https://a2aproject.github.io/A2A/latest/topics/life-of-a-task/
+**Pointer Utilities**: Use `pkg/ptr` for optional fields:
+- `ptr.Float32(0.7)` for float32 pointers
+- `ptr.Ptr(value)` for generic type pointers
+
+**Event Streaming**: Agents communicate via channels, not direct calls:
+```go
+// Good: Channel-based event streaming
+eventChan := make(chan *core.Event, 100)
+go agent.RunAsync(ctx, eventChan)
+
+// Bad: Direct synchronous calls
+```
+
+**Testing**: Mock LLM connections with `MockLLMConnection`, test async patterns with goroutines and channels.
+
+## Development Workflow
+
+**Build & Test**:
+```bash
+go install ./...          # Build CLI and tools
+go test ./...             # Run all tests
+go run ./cmd/adk web examples/agents  # Start web UI
+```
+
+**CLI Usage**:
+- `adk run <agent_path>` - Interactive CLI with agent
+- `adk web <agents_dir>` - Web UI for testing agents  
+- `adk create <name>` - Scaffold new agent
+
+## A2A Protocol Compliance
+
+**Kind Fields**: Always set correct `Kind` values:
+- `Task`: `"task"`
+- `TaskStatusUpdateEvent`: `"status-update"`  
+- `TaskArtifactUpdateEvent`: `"artifact-update"`
+- `Message`: `"message"`
+
+**Agent Registration**: Agents must provide `AgentCard` with capabilities, skills, and authentication schemes.
+
+## Project-Specific Conventions
+
+**Error Handling**: Always return explicit errors, use `fmt.Errorf` for context wrapping.
+
+**Concurrency**: Use goroutines/channels over mutexes where possible. All session services are thread-safe.
+
+**LLM Integration**: Use `pkg/llmconnect/ollama` for local models, follow the `LLMConnection` interface for new providers.
+
+**Agent Hierarchies**: Use `SubAgents()` and `SetParentAgent()` for composition, `FindAgent()` for lookup.
+
+Reference `examples/agents/llm_agent/` for canonical agent implementation patterns.
