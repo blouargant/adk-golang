@@ -16,11 +16,13 @@ import (
 )
 
 var _ core.LLMConnection = (*OpenAIConnection)(nil)
+var _ OpenAIConnectionInterface = (*OpenAIConnection)(nil)
 
-// OpenAIConnection implements the LLMConnection interface for OpenAI.
+// OpenAIConnection implements the OpenAIConnectionInterface for OpenAI.
 type OpenAIConnection struct {
-	client *openai.Client
-	config *OpenAIConfig
+	client       *openai.Client
+	config       *OpenAIConfig
+	providerName string
 }
 
 // OpenAIConfig contains configuration options for OpenAI connections.
@@ -33,14 +35,6 @@ type OpenAIConfig struct {
 	TopP        *float32      `json:"top_p,omitempty"`
 	Timeout     time.Duration `json:"timeout"`
 	Stream      bool          `json:"stream"`
-}
-
-func printDebug(name string, data any) {
-	if jsonData, err := json.MarshalIndent(data, "", "  "); err == nil {
-		fmt.Printf("--- DEBUG [%s] ---\n%s\n", name, string(jsonData))
-	} else {
-		fmt.Printf("--- DEBUG [%s] ERROR ---\n%v\n", name, err)
-	}
 }
 
 // DefaultOpenAIConfig returns a default configuration for OpenAI.
@@ -57,6 +51,12 @@ func DefaultOpenAIConfig() *OpenAIConfig {
 
 // NewOpenAIConnection creates a new OpenAI connection with the given configuration.
 func NewOpenAIConnection(config *OpenAIConfig) *OpenAIConnection {
+	return NewOpenAIConnectionWithProvider(config, "openai")
+}
+
+// NewOpenAIConnectionWithProvider creates a new OpenAI-compatible connection with a custom provider name.
+// This is useful for OpenAI-compatible APIs like Azure OpenAI, Anthropic, etc.
+func NewOpenAIConnectionWithProvider(config *OpenAIConfig, providerName string) *OpenAIConnection {
 	if config == nil {
 		config = DefaultOpenAIConfig()
 	}
@@ -74,31 +74,42 @@ func NewOpenAIConnection(config *OpenAIConfig) *OpenAIConnection {
 	client := openai.NewClient(opts...)
 
 	return &OpenAIConnection{
-		client: &client,
-		config: config,
+		client:       &client,
+		config:       config,
+		providerName: providerName,
 	}
+}
+
+// NewOpenAIConnectionInterface creates a new OpenAI connection that implements OpenAIConnectionInterface.
+// This is the recommended way to create connections when you need the interface.
+func NewOpenAIConnectionInterface(config *OpenAIConfig) OpenAIConnectionInterface {
+	return NewOpenAIConnection(config)
+}
+
+// NewOpenAICompatibleConnection creates a new OpenAI-compatible connection for third-party providers.
+// This function is useful for creating connections to services like Azure OpenAI, Anthropic Claude API, etc.
+func NewOpenAICompatibleConnection(config *OpenAIConfig, providerName string) OpenAIConnectionInterface {
+	return NewOpenAIConnectionWithProvider(config, providerName)
 }
 
 // GenerateContent sends a request to OpenAI and returns the response.
 func (c *OpenAIConnection) GenerateContent(ctx context.Context, request *core.LLMRequest) (*core.LLMResponse, error) {
 	// Convert ADK request to OpenAI format
-	printDebug("request", request)
 	chatReq, err := c.convertToOpenAIRequest(request)
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert request: %w", err)
 	}
-	printDebug("chatReq", chatReq)
-
 	// Make request to OpenAI
 	chatResp, err := c.client.Chat.Completions.New(ctx, *chatReq)
 	if err != nil {
 		fmt.Printf("OpenAI API request failed: %v\n", err)
 		return nil, fmt.Errorf("OpenAI API request failed: %w", err)
 	}
-	printDebug("chatResp", chatResp)
 	// Convert to ADK response
 	resp := c.convertFromOpenAIResponse(*chatResp)
-	printDebug("response", resp)
+	if resp == nil {
+		return nil, fmt.Errorf("failed to generate response")
+	}
 	return resp, nil
 }
 
@@ -239,89 +250,100 @@ func (c *OpenAIConnection) convertToOpenAIRequest(request *core.LLMRequest) (*op
 	messages := make([]openai.ChatCompletionMessageParamUnion, 0, len(request.Contents))
 	for _, content := range request.Contents {
 		role := c.mapRole(content.Role)
-		//printDebug("role", role)
+		// Handle assistant messages with function calls specially
+		if role == "assistant" {
+			// Check if this content has function calls
+			var toolCalls []openai.ChatCompletionMessageToolCallParam
+			var textParts []string
 
-		// Process content parts to combine text
-		var textParts []string
-		var hasToolCalls bool
-
-		for _, part := range content.Parts {
-			//printDebug("part", part)
-			switch part.Type {
-			case "text":
-				if part.Text != nil {
-					textParts = append(textParts, *part.Text)
-				}
-			case "function_call":
-				if part.FunctionCall != nil {
-					hasToolCalls = true
-					// For now, represent as text until we get tool calls working properly
-					textParts = append(textParts, fmt.Sprintf("Calling function: %s(%s)",
-						part.FunctionCall.Name, c.convertArgsToJSON(part.FunctionCall.Args)))
-				}
-			case "function_response":
-				if part.FunctionResponse != nil {
-					// For function responses, create a tool message
-					msg, err := c.convertResponseToJSON(part.FunctionResponse.Response)
-					if err == nil {
-						toolMessage := openai.ToolMessage(
-							msg,
-							part.FunctionResponse.ID,
-						)
-						messages = append(messages, toolMessage)
+			for _, part := range content.Parts {
+				switch part.Type {
+				case "text":
+					if part.Text != nil {
+						textParts = append(textParts, *part.Text)
 					}
-					continue // Skip the regular message creation for this part
-				}
-			default:
-				if part.Text != nil {
-					textParts = append(textParts, *part.Text)
+				case "function_call":
+					if part.FunctionCall != nil {
+						toolCall := openai.ChatCompletionMessageToolCallParam{
+							ID:   part.FunctionCall.ID,
+							Type: "function",
+							Function: openai.ChatCompletionMessageToolCallFunctionParam{
+								Name:      part.FunctionCall.Name,
+								Arguments: c.convertArgsToJSON(part.FunctionCall.Args),
+							},
+						}
+						toolCalls = append(toolCalls, toolCall)
+					}
 				}
 			}
-		}
 
-		// Skip messages with no content
-		contentText := strings.Join(textParts, "\n")
-		if contentText == "" && !hasToolCalls {
+			// Create assistant message with or without tool calls
+			contentText := strings.Join(textParts, "\n")
+			if len(toolCalls) > 0 {
+				// For assistant messages with tool calls, we need to manually create the param
+				assistantMsg := openai.ChatCompletionAssistantMessageParam{
+					ToolCalls: toolCalls,
+				}
+				if contentText != "" {
+					assistantMsg.Content.OfString = openai.String(contentText)
+				}
+				messages = append(messages, openai.ChatCompletionMessageParamUnion{OfAssistant: &assistantMsg})
+			} else if contentText != "" {
+				// Regular assistant message
+				message := openai.AssistantMessage(contentText)
+				messages = append(messages, message)
+			}
+			continue
+		}
+		if role == "tool" {
+			// Convert tool messages to tool messages
+			for _, part := range content.Parts {
+				if part.Type == "function_response" && part.FunctionResponse != nil {
+					msg, err := c.convertResponseToJSON(part.FunctionResponse.Response)
+					if err == nil {
+						toolMessage := openai.ToolMessage(msg, part.FunctionResponse.ID)
+						messages = append(messages, toolMessage)
+					}
+				}
+			}
 			continue
 		}
 
-		// Create message based on role and content
+		// Handle function responses as tool messages
+		for _, part := range content.Parts {
+			if part.Type == "function_response" && part.FunctionResponse != nil {
+				msg, err := c.convertResponseToJSON(part.FunctionResponse.Response)
+				if err == nil {
+					toolMessage := openai.ToolMessage(msg, part.FunctionResponse.ID)
+					messages = append(messages, toolMessage)
+				}
+			}
+		}
+
+		// Handle other message types (system, user, etc.)
+		var textParts []string
+		for _, part := range content.Parts {
+			if part.Text != nil {
+				textParts = append(textParts, *part.Text)
+			}
+		}
+
+		contentText := strings.Join(textParts, "\n")
+		if contentText == "" {
+			continue
+		}
+
 		switch role {
 		case "system":
-			if contentText != "" {
-				message := openai.SystemMessage(contentText)
-				messages = append(messages, message)
-			}
+			message := openai.SystemMessage(contentText)
+			messages = append(messages, message)
 		case "user":
-			if contentText != "" {
-				message := openai.UserMessage(contentText)
-				messages = append(messages, message)
-			}
-		case "assistant":
-			if contentText != "" {
-				message := openai.AssistantMessage(contentText)
-				messages = append(messages, message)
-			}
-		case "tool":
-			// For tool messages, we will handle them separately
-			if contentText != "" {
-				toolMessage := openai.ToolMessage(contentText, "")
-				messages = append(messages, toolMessage)
-
-			}
-		case "agent":
-			// For agent messages, treat as assistant
-			if contentText != "" {
-				// Use assistant message for agent role
-				message := openai.AssistantMessage(contentText)
-				messages = append(messages, message)
-			}
+			message := openai.UserMessage(contentText)
+			messages = append(messages, message)
 		default:
 			// Default to user message
-			if contentText != "" {
-				message := openai.UserMessage(contentText)
-				messages = append(messages, message)
-			}
+			message := openai.UserMessage(contentText)
+			messages = append(messages, message)
 		}
 	}
 
@@ -517,8 +539,10 @@ func (c *OpenAIConnection) mapRole(role string) string {
 	switch role {
 	case "user":
 		return "user"
-	case "agent", "model", "assistant":
+	case "model", "assistant":
 		return "assistant"
+	case "agent":
+		return "tool"
 	case "system":
 		return "system"
 	default:
@@ -538,4 +562,93 @@ func (c *OpenAIConnection) mapRoleFromOpenAI(role string) string {
 	default:
 		return "assistant"
 	}
+}
+
+// GetConfig returns the configuration used by this connection.
+func (c *OpenAIConnection) GetConfig() *OpenAIConfig {
+	return c.config
+}
+
+// SetConfig updates the configuration for this connection.
+func (c *OpenAIConnection) SetConfig(config *OpenAIConfig) error {
+	if config == nil {
+		return fmt.Errorf("config cannot be nil")
+	}
+
+	// Validate the new configuration
+	if config.APIKey == "" {
+		return fmt.Errorf("API key is required")
+	}
+	if config.Model == "" {
+		return fmt.Errorf("model is required")
+	}
+
+	// Update the configuration
+	c.config = config
+
+	// Recreate the client with new configuration
+	opts := []option.RequestOption{
+		option.WithAPIKey(config.APIKey),
+	}
+
+	if config.BaseURL != "" {
+		opts = append(opts, option.WithBaseURL(config.BaseURL))
+	}
+
+	client := openai.NewClient(opts...)
+	c.client = &client
+
+	return nil
+}
+
+// GetModel returns the currently configured model.
+func (c *OpenAIConnection) GetModel() string {
+	if c.config == nil {
+		return ""
+	}
+	return c.config.Model
+}
+
+// SetModel updates the model for this connection.
+func (c *OpenAIConnection) SetModel(model string) {
+	if c.config != nil {
+		c.config.Model = model
+	}
+}
+
+// ValidateConfig validates the current configuration.
+func (c *OpenAIConnection) ValidateConfig() error {
+	if c.config == nil {
+		return fmt.Errorf("configuration is nil")
+	}
+
+	if c.config.APIKey == "" {
+		return fmt.Errorf("API key is required")
+	}
+
+	if c.config.Model == "" {
+		return fmt.Errorf("model is required")
+	}
+
+	if c.config.Temperature != nil && (*c.config.Temperature < 0 || *c.config.Temperature > 2) {
+		return fmt.Errorf("temperature must be between 0 and 2")
+	}
+
+	if c.config.TopP != nil && (*c.config.TopP < 0 || *c.config.TopP > 1) {
+		return fmt.Errorf("top_p must be between 0 and 1")
+	}
+
+	if c.config.MaxTokens != nil && *c.config.MaxTokens <= 0 {
+		return fmt.Errorf("max_tokens must be positive")
+	}
+
+	return nil
+}
+
+// GetProviderName returns the name of the API provider.
+func (c *OpenAIConnection) GetProviderName() string {
+	if c.providerName != "" {
+		return c.providerName
+	}
+	return "openai"
 }

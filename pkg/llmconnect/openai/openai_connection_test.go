@@ -109,7 +109,7 @@ func TestRoleMapping(t *testing.T) {
 	}{
 		{"user", "user"},
 		{"assistant", "assistant"},
-		{"agent", "assistant"},
+		{"agent", "tool"},
 		{"model", "assistant"},
 		{"system", "system"},
 		{"unknown", "user"},
@@ -156,5 +156,97 @@ func TestCloseConnection(t *testing.T) {
 	err := conn.Close(ctx)
 	if err != nil {
 		t.Errorf("Expected Close to return nil, got %v", err)
+	}
+}
+
+func TestConvertToOpenAIRequestWithToolCalls(t *testing.T) {
+	conn := NewOpenAIConnection(nil)
+
+	// Test converting assistant message with tool calls
+	request := &core.LLMRequest{
+		Contents: []core.Content{
+			{
+				Role: "user",
+				Parts: []core.Part{
+					{
+						Type: "text",
+						Text: ptr.Ptr("What's the weather in New York?"),
+					},
+				},
+			},
+			{
+				Role: "assistant",
+				Parts: []core.Part{
+					{
+						Type: "text",
+						Text: ptr.Ptr("I'll check the weather for you."),
+					},
+					{
+						Type: "function_call",
+						FunctionCall: &core.FunctionCall{
+							ID:   "call_123",
+							Name: "get_weather",
+							Args: map[string]any{
+								"location": "New York",
+							},
+						},
+					},
+				},
+			},
+			{
+				Role: "tool",
+				Parts: []core.Part{
+					{
+						Type: "function_response",
+						FunctionResponse: &core.FunctionResponse{
+							ID:   "call_123",
+							Name: "get_weather",
+							Response: map[string]any{
+								"temperature": "22°C",
+								"condition":   "sunny",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	chatReq, err := conn.convertToOpenAIRequest(request)
+	if err != nil {
+		t.Fatalf("Expected no error converting request, got %v", err)
+	}
+
+	if len(chatReq.Messages) != 3 {
+		t.Fatalf("Expected 3 messages, got %d", len(chatReq.Messages))
+	}
+
+	// Check user message
+	if userMsg := chatReq.Messages[0].GetContent().AsAny(); userMsg != nil {
+		if content, ok := userMsg.(*string); ok {
+			if *content != "What's the weather in New York?" {
+				t.Errorf("Expected user message content to be 'What's the weather in New York?', got %s", *content)
+			}
+		}
+	}
+
+	// Check assistant message with tool calls
+	assistantToolCalls := chatReq.Messages[1].GetToolCalls()
+	if len(assistantToolCalls) != 1 {
+		t.Fatalf("Expected 1 tool call, got %d", len(assistantToolCalls))
+	}
+
+	toolCall := assistantToolCalls[0]
+	if toolCall.ID != "call_123" {
+		t.Errorf("Expected tool call ID to be 'call_123', got %s", toolCall.ID)
+	}
+	if toolCall.Function.Name != "get_weather" {
+		t.Errorf("Expected tool call function name to be 'get_weather', got %s", toolCall.Function.Name)
+	}
+
+	// Check tool message
+	toolCallID := chatReq.Messages[2].GetToolCallID()
+	if toolCallID == nil || *toolCallID != "call_123" {
+		t.Errorf("Expected tool call ID to be 'call_123', got %v", toolCallID)
 	}
 }
